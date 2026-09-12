@@ -1,4 +1,5 @@
 import os
+import json
 import time
 from typing import Dict, Set, List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -19,6 +20,11 @@ app.add_middleware(
 TOKEN = os.getenv("YANDEX_TOKEN")
 client = Client(TOKEN).init()
 
+# Файл персистентности. На Render free tier диск эфемерный, но между
+# перезапусками одного и того же контейнера файл живёт. Плюс клиенты
+# дублируют очередь в localStorage — это страховка на случай засыпания.
+STATE_FILE = os.getenv("STATE_FILE", "rooms_state.json")
+
 
 class Room:
     def __init__(self):
@@ -35,10 +41,52 @@ class Room:
             return self.current_time + (time.time() - self.last_update)
         return self.current_time
 
+    def to_dict(self) -> dict:
+        return {
+            "queue": self.queue,
+            "current_index": self.current_index,
+            "current_time": self.current_time,
+            "is_playing": self.is_playing,
+            "last_update": self.last_update,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Room":
+        room = cls()
+        room.queue = data.get("queue", [])
+        room.current_index = data.get("current_index", -1)
+        room.current_time = data.get("current_time", 0.0)
+        room.is_playing = data.get("is_playing", False)
+        room.last_update = data.get("last_update", time.time())
+        return room
+
 
 class ConnectionManager:
     def __init__(self):
         self.rooms: Dict[str, Room] = {}
+        self._load_state()
+
+    # --- Персистентность ---
+    def _load_state(self):
+        try:
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                for room_id, data in raw.items():
+                    self.rooms[room_id] = Room.from_dict(data)
+                print(f"[state] loaded {len(self.rooms)} room(s) from {STATE_FILE}")
+        except Exception as e:
+            print(f"[state] load error: {e}")
+
+    def save_state(self):
+        try:
+            snapshot = {rid: r.to_dict() for rid, r in self.rooms.items()}
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False)
+            os.replace(tmp, STATE_FILE)
+        except Exception as e:
+            print(f"[state] save error: {e}")
 
     def get_room(self, room_id: str) -> Room:
         if room_id not in self.rooms:
@@ -54,8 +102,9 @@ class ConnectionManager:
         if room_id in self.rooms:
             room = self.rooms[room_id]
             room.connections.discard(websocket)
-            if not room.connections:
-                del self.rooms[room_id]
+            # ВАЖНО: комнату НЕ удаляем, даже если все отключились —
+            # иначе потеряем очередь и «запоминание музыки» не сработает.
+            # Пустые комнаты остаются в файле до ручной очистки.
 
     async def broadcast(self, message: dict, room_id: str, sender: WebSocket = None):
         if room_id not in self.rooms:
@@ -149,6 +198,7 @@ async def send_full_state(websocket: WebSocket, room: Room):
 
 async def broadcast_queue_update(room_id: str, room: Room):
     """Хелпер: рассылает актуальный queue_update всем в комнате."""
+    manager.save_state()
     await manager.broadcast({
         "type": "queue_update",
         "queue": room.queue,
@@ -162,6 +212,7 @@ async def broadcast_play_track(room_id: str, room: Room, index: int, time_: floa
     room.current_time = time_
     room.is_playing = True
     room.last_update = time.time()
+    manager.save_state()
     await manager.broadcast({
         "type": "play_track",
         "track": room.queue[index],
@@ -192,6 +243,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 title = data.get("title", "")
                 artist = data.get("artist", "")
                 cover = data.get("cover", "")
+                added_by = data.get("added_by", "") or "Кто-то"
                 if track_id:
                     try:
                         track_obj = client.tracks([str(track_id)])[0]
@@ -208,6 +260,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                             "artist": artist,
                             "url": url,
                             "cover": cover,
+                            "added_by": added_by,
                         }
                         room.queue.append(queue_track)
 
@@ -225,7 +278,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     room.queue.pop(index)
 
                     if was_current:
-                        # Удалили играющий трек.
                         if not room.queue:
                             room.current_index = -1
                             room.current_time = 0.0
@@ -233,12 +285,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                             room.last_update = time.time()
                             await broadcast_queue_update(room_id, room)
                         else:
-                            # Играем трек, вставший на место удалённого
-                            # (если удалили последний — играем предыдущий).
                             new_index = min(index, len(room.queue) - 1)
                             await broadcast_play_track(room_id, room, new_index, 0.0)
                     else:
-                        # Удалили не текущий — просто корректируем индекс.
                         if index < room.current_index:
                             room.current_index -= 1
                         await broadcast_queue_update(room_id, room)
@@ -252,7 +301,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     track = room.queue.pop(from_index)
                     room.queue.insert(to_index, track)
 
-                    # Корректируем current_index
                     if room.current_index == from_index:
                         room.current_index = to_index
                     elif from_index < room.current_index <= to_index:
@@ -276,10 +324,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     await broadcast_play_track(room_id, room, index, 0.0)
 
             elif msg_type == "track_ended":
-                # Идемпотентность: клиент присылает expected_index — индекс,
-                # который у него считался текущим. Если на сервере уже другой
-                # (например, второй участник успел прислать track_ended),
-                # игнорируем — иначе трек перепрыгнет дважды.
                 expected_index = data.get("expected_index")
                 if expected_index is not None and expected_index != room.current_index:
                     continue
@@ -288,22 +332,26 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 else:
                     room.is_playing = False
                     room.last_update = time.time()
+                    manager.save_state()
 
             elif msg_type == "play":
                 room.is_playing = True
                 room.current_time = data.get("time", 0)
                 room.last_update = time.time()
+                manager.save_state()
                 await manager.broadcast(data, room_id, sender=websocket)
 
             elif msg_type == "pause":
                 room.is_playing = False
                 room.current_time = data.get("time", room.get_position())
                 room.last_update = time.time()
+                manager.save_state()
                 await manager.broadcast(data, room_id, sender=websocket)
 
             elif msg_type == "seek":
                 room.current_time = data.get("time", 0)
                 room.last_update = time.time()
+                manager.save_state()
                 await manager.broadcast(data, room_id, sender=websocket)
 
             else:
