@@ -22,8 +22,8 @@ client = Client(TOKEN).init()
 class Room:
     def __init__(self):
         self.connections: Set[WebSocket] = set()
-        self.queue: List[dict] = []  # список треков: {id, title, artist, url}
-        self.current_index: int = -1  # индекс играющего трека
+        self.queue: List[dict] = []
+        self.current_index: int = -1
 
 
 class ConnectionManager:
@@ -132,23 +132,40 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             msg_type = data.get("type")
 
             if msg_type == "add_to_queue":
-                # Добавляем трек в очередь
-                track = data.get("track")
-                if track:
-                    room.queue.append(track)
-                    # Если ничего не играет — начинаем с первого
-                    if room.current_index == -1:
-                        room.current_index = 0
+                track_id = data.get("track_id")
+                title = data.get("title", "")
+                artist = data.get("artist", "")
+                if track_id:
+                    try:
+                        # Получаем ссылку на сервере — фронтенд не ждёт HTTP
+                        track_obj = client.tracks([str(track_id)])[0]
+                        download_info = track_obj.get_download_info()
+                        best = download_info[-1]
+                        url = best.get_direct_link()
+
+                        queue_track = {
+                            "id": track_id,
+                            "title": title,
+                            "artist": artist,
+                            "url": url,
+                        }
+                        room.queue.append(queue_track)
+
+                        if room.current_index == -1:
+                            room.current_index = 0
+                            await manager.broadcast({
+                                "type": "play_track",
+                                "track": room.queue[0],
+                                "index": 0,
+                            }, room_id, sender=None)
+
                         await manager.broadcast({
-                            "type": "play_track",
-                            "track": room.queue[0],
-                            "index": 0,
-                        }, room_id, sender=websocket)
-                    await manager.broadcast({
-                        "type": "queue_update",
-                        "queue": room.queue,
-                        "current_index": room.current_index,
-                    }, room_id, sender=websocket)
+                            "type": "queue_update",
+                            "queue": room.queue,
+                            "current_index": room.current_index,
+                        }, room_id, sender=None)
+                    except Exception as e:
+                        print(f"Error adding track: {e}")
 
             elif msg_type == "remove_from_queue":
                 index = data.get("index")
@@ -157,51 +174,63 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     if index < room.current_index:
                         room.current_index -= 1
                     elif index == room.current_index:
-                        # Удалили играющий трек — переходим к следующему
                         if room.current_index >= len(room.queue):
                             room.current_index = -1
                         await manager.broadcast({
                             "type": "queue_update",
                             "queue": room.queue,
                             "current_index": room.current_index,
-                        }, room_id, sender=websocket)
+                        }, room_id, sender=None)
                         if room.current_index >= 0:
                             await manager.broadcast({
                                 "type": "play_track",
                                 "track": room.queue[room.current_index],
                                 "index": room.current_index,
-                            }, room_id, sender=websocket)
+                            }, room_id, sender=None)
                     else:
                         await manager.broadcast({
                             "type": "queue_update",
                             "queue": room.queue,
                             "current_index": room.current_index,
-                        }, room_id, sender=websocket)
+                        }, room_id, sender=None)
 
             elif msg_type == "next_track":
-                # Переход к следующему треку
                 if room.queue and room.current_index < len(room.queue) - 1:
                     room.current_index += 1
                     await manager.broadcast({
                         "type": "play_track",
                         "track": room.queue[room.current_index],
                         "index": room.current_index,
-                    }, room_id, sender=websocket)
+                    }, room_id, sender=None)
                     await manager.broadcast({
                         "type": "queue_update",
                         "queue": room.queue,
                         "current_index": room.current_index,
-                    }, room_id, sender=websocket)
+                    }, room_id, sender=None)
+
+            elif msg_type == "play_track_manual":
+                index = data.get("index")
+                if index is not None and 0 <= index < len(room.queue):
+                    room.current_index = index
+                    await manager.broadcast({
+                        "type": "play_track",
+                        "track": room.queue[index],
+                        "index": index,
+                    }, room_id, sender=None)
+                    await manager.broadcast({
+                        "type": "queue_update",
+                        "queue": room.queue,
+                        "current_index": room.current_index,
+                    }, room_id, sender=None)
 
             elif msg_type == "track_ended":
-                # Текущий трек закончился — переходим к следующему
                 if room.queue and room.current_index < len(room.queue) - 1:
                     room.current_index += 1
                     await manager.broadcast({
                         "type": "play_track",
                         "track": room.queue[room.current_index],
                         "index": room.current_index,
-                    }, room_id, sender=None)  # всем, включая инициатора
+                    }, room_id, sender=None)
                     await manager.broadcast({
                         "type": "queue_update",
                         "queue": room.queue,
@@ -209,7 +238,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     }, room_id, sender=None)
 
             else:
-                # Остальные команды (play, pause, seek, track) — просто пересылаем
+                # play, pause, seek — пересылаем остальным
                 await manager.broadcast(data, room_id, sender=websocket)
 
     except WebSocketDisconnect:
