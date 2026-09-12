@@ -147,6 +147,30 @@ async def send_full_state(websocket: WebSocket, room: Room):
     })
 
 
+async def broadcast_queue_update(room_id: str, room: Room):
+    """Хелпер: рассылает актуальный queue_update всем в комнате."""
+    await manager.broadcast({
+        "type": "queue_update",
+        "queue": room.queue,
+        "current_index": room.current_index,
+    }, room_id, sender=None)
+
+
+async def broadcast_play_track(room_id: str, room: Room, index: int, time_: float = 0.0):
+    """Хелпер: рассылает play_track и queue_update, выставляет состояние комнаты."""
+    room.current_index = index
+    room.current_time = time_
+    room.is_playing = True
+    room.last_update = time.time()
+    await manager.broadcast({
+        "type": "play_track",
+        "track": room.queue[index],
+        "index": index,
+        "time": time_,
+    }, room_id, sender=None)
+    await broadcast_queue_update(room_id, room)
+
+
 @app.websocket("/ws/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
     await manager.connect(websocket, room_id)
@@ -188,56 +212,36 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                         room.queue.append(queue_track)
 
                         if room.current_index == -1:
-                            room.current_index = 0
-                            room.current_time = 0.0
-                            room.is_playing = True
-                            room.last_update = time.time()
-                            await manager.broadcast({
-                                "type": "play_track",
-                                "track": room.queue[0],
-                                "index": 0,
-                                "time": 0,
-                            }, room_id, sender=None)
-
-                        await manager.broadcast({
-                            "type": "queue_update",
-                            "queue": room.queue,
-                            "current_index": room.current_index,
-                        }, room_id, sender=None)
+                            await broadcast_play_track(room_id, room, 0, 0.0)
+                        else:
+                            await broadcast_queue_update(room_id, room)
                     except Exception as e:
                         print(f"Error adding track: {e}")
 
             elif msg_type == "remove_from_queue":
                 index = data.get("index")
                 if index is not None and 0 <= index < len(room.queue):
+                    was_current = (index == room.current_index)
                     room.queue.pop(index)
-                    if index < room.current_index:
-                        room.current_index -= 1
-                    elif index == room.current_index:
-                        if room.current_index >= len(room.queue):
+
+                    if was_current:
+                        # Удалили играющий трек.
+                        if not room.queue:
                             room.current_index = -1
-                            room.is_playing = False
-                        await manager.broadcast({
-                            "type": "queue_update",
-                            "queue": room.queue,
-                            "current_index": room.current_index,
-                        }, room_id, sender=None)
-                        if room.current_index >= 0:
                             room.current_time = 0.0
-                            room.is_playing = True
+                            room.is_playing = False
                             room.last_update = time.time()
-                            await manager.broadcast({
-                                "type": "play_track",
-                                "track": room.queue[room.current_index],
-                                "index": room.current_index,
-                                "time": 0,
-                            }, room_id, sender=None)
+                            await broadcast_queue_update(room_id, room)
+                        else:
+                            # Играем трек, вставший на место удалённого
+                            # (если удалили последний — играем предыдущий).
+                            new_index = min(index, len(room.queue) - 1)
+                            await broadcast_play_track(room_id, room, new_index, 0.0)
                     else:
-                        await manager.broadcast({
-                            "type": "queue_update",
-                            "queue": room.queue,
-                            "current_index": room.current_index,
-                        }, room_id, sender=None)
+                        # Удалили не текущий — просто корректируем индекс.
+                        if index < room.current_index:
+                            room.current_index -= 1
+                        await broadcast_queue_update(room_id, room)
 
             elif msg_type == "reorder_queue":
                 from_index = data.get("from")
@@ -256,86 +260,34 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     elif to_index <= room.current_index < from_index:
                         room.current_index += 1
 
-                    await manager.broadcast({
-                        "type": "queue_update",
-                        "queue": room.queue,
-                        "current_index": room.current_index,
-                    }, room_id, sender=None)
+                    await broadcast_queue_update(room_id, room)
 
             elif msg_type == "next_track":
                 if room.queue and room.current_index < len(room.queue) - 1:
-                    room.current_index += 1
-                    room.current_time = 0.0
-                    room.is_playing = True
-                    room.last_update = time.time()
-                    await manager.broadcast({
-                        "type": "play_track",
-                        "track": room.queue[room.current_index],
-                        "index": room.current_index,
-                        "time": 0,
-                    }, room_id, sender=None)
-                    await manager.broadcast({
-                        "type": "queue_update",
-                        "queue": room.queue,
-                        "current_index": room.current_index,
-                    }, room_id, sender=None)
+                    await broadcast_play_track(room_id, room, room.current_index + 1, 0.0)
 
             elif msg_type == "prev_track":
                 if room.queue and room.current_index > 0:
-                    room.current_index -= 1
-                    room.current_time = 0.0
-                    room.is_playing = True
-                    room.last_update = time.time()
-                    await manager.broadcast({
-                        "type": "play_track",
-                        "track": room.queue[room.current_index],
-                        "index": room.current_index,
-                        "time": 0,
-                    }, room_id, sender=None)
-                    await manager.broadcast({
-                        "type": "queue_update",
-                        "queue": room.queue,
-                        "current_index": room.current_index,
-                    }, room_id, sender=None)
+                    await broadcast_play_track(room_id, room, room.current_index - 1, 0.0)
 
             elif msg_type == "play_track_manual":
                 index = data.get("index")
                 if index is not None and 0 <= index < len(room.queue):
-                    room.current_index = index
-                    room.current_time = 0.0
-                    room.is_playing = True
-                    room.last_update = time.time()
-                    await manager.broadcast({
-                        "type": "play_track",
-                        "track": room.queue[index],
-                        "index": index,
-                        "time": 0,
-                    }, room_id, sender=None)
-                    await manager.broadcast({
-                        "type": "queue_update",
-                        "queue": room.queue,
-                        "current_index": room.current_index,
-                    }, room_id, sender=None)
+                    await broadcast_play_track(room_id, room, index, 0.0)
 
             elif msg_type == "track_ended":
+                # Идемпотентность: клиент присылает expected_index — индекс,
+                # который у него считался текущим. Если на сервере уже другой
+                # (например, второй участник успел прислать track_ended),
+                # игнорируем — иначе трек перепрыгнет дважды.
+                expected_index = data.get("expected_index")
+                if expected_index is not None and expected_index != room.current_index:
+                    continue
                 if room.queue and room.current_index < len(room.queue) - 1:
-                    room.current_index += 1
-                    room.current_time = 0.0
-                    room.is_playing = True
-                    room.last_update = time.time()
-                    await manager.broadcast({
-                        "type": "play_track",
-                        "track": room.queue[room.current_index],
-                        "index": room.current_index,
-                        "time": 0,
-                    }, room_id, sender=None)
-                    await manager.broadcast({
-                        "type": "queue_update",
-                        "queue": room.queue,
-                        "current_index": room.current_index,
-                    }, room_id, sender=None)
+                    await broadcast_play_track(room_id, room, room.current_index + 1, 0.0)
                 else:
                     room.is_playing = False
+                    room.last_update = time.time()
 
             elif msg_type == "play":
                 room.is_playing = True
