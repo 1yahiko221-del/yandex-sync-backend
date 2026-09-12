@@ -116,7 +116,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
     await manager.connect(websocket, room_id)
     room = manager.get_room(room_id)
 
-    # При подключении отправляем текущее состояние очереди
     try:
         await websocket.send_json({
             "type": "queue_update",
@@ -137,7 +136,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 artist = data.get("artist", "")
                 if track_id:
                     try:
-                        # Получаем ссылку на сервере — фронтенд не ждёт HTTP
                         track_obj = client.tracks([str(track_id)])[0]
                         download_info = track_obj.get_download_info()
                         best = download_info[-1]
@@ -208,6 +206,20 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                         "current_index": room.current_index,
                     }, room_id, sender=None)
 
+            elif msg_type == "prev_track":
+                if room.queue and room.current_index > 0:
+                    room.current_index -= 1
+                    await manager.broadcast({
+                        "type": "play_track",
+                        "track": room.queue[room.current_index],
+                        "index": room.current_index,
+                    }, room_id, sender=None)
+                    await manager.broadcast({
+                        "type": "queue_update",
+                        "queue": room.queue,
+                        "current_index": room.current_index,
+                    }, room_id, sender=None)
+
             elif msg_type == "play_track_manual":
                 index = data.get("index")
                 if index is not None and 0 <= index < len(room.queue):
@@ -238,7 +250,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     }, room_id, sender=None)
 
             else:
-                # play, pause, seek — пересылаем остальным
                 await manager.broadcast(data, room_id, sender=websocket)
 
     except WebSocketDisconnect:
