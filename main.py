@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Set
+from typing import Dict, Set, List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
@@ -19,33 +19,43 @@ TOKEN = os.getenv("YANDEX_TOKEN")
 client = Client(TOKEN).init()
 
 
+class Room:
+    def __init__(self):
+        self.connections: Set[WebSocket] = set()
+        self.queue: List[dict] = []  # список треков: {id, title, artist, url}
+        self.current_index: int = -1  # индекс играющего трека
+
+
 class ConnectionManager:
     def __init__(self):
-        # Теперь храним комнаты: {room_id: set(websockets)}
-        self.rooms: Dict[str, Set[WebSocket]] = {}
+        self.rooms: Dict[str, Room] = {}
+
+    def get_room(self, room_id: str) -> Room:
+        if room_id not in self.rooms:
+            self.rooms[room_id] = Room()
+        return self.rooms[room_id]
 
     async def connect(self, websocket: WebSocket, room_id: str):
         await websocket.accept()
-        if room_id not in self.rooms:
-            self.rooms[room_id] = set()
-        self.rooms[room_id].add(websocket)
+        room = self.get_room(room_id)
+        room.connections.add(websocket)
 
     def disconnect(self, websocket: WebSocket, room_id: str):
         if room_id in self.rooms:
-            self.rooms[room_id].discard(websocket)
-            if not self.rooms[room_id]:
+            room = self.rooms[room_id]
+            room.connections.discard(websocket)
+            if not room.connections:
                 del self.rooms[room_id]
 
-    async def broadcast(self, message: dict, room_id: str, sender: WebSocket):
-        """Рассылает всем в комнате, КРОМЕ отправителя."""
+    async def broadcast(self, message: dict, room_id: str, sender: WebSocket = None):
         if room_id not in self.rooms:
             return
-        for connection in list(self.rooms[room_id]):
+        for connection in list(self.rooms[room_id].connections):
             if connection != sender:
                 try:
                     await connection.send_json(message)
                 except Exception:
-                    self.rooms[room_id].discard(connection)
+                    self.rooms[room_id].connections.discard(connection)
 
 
 manager = ConnectionManager()
@@ -104,12 +114,106 @@ async def get_track_link(req: TrackRequest):
 @app.websocket("/ws/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
     await manager.connect(websocket, room_id)
+    room = manager.get_room(room_id)
+
+    # При подключении отправляем текущее состояние очереди
+    try:
+        await websocket.send_json({
+            "type": "queue_update",
+            "queue": room.queue,
+            "current_index": room.current_index,
+        })
+    except Exception:
+        pass
+
     try:
         while True:
             data = await websocket.receive_json()
-            # Рассылаем всем кроме отправителя
-            await manager.broadcast(data, room_id, websocket)
+            msg_type = data.get("type")
+
+            if msg_type == "add_to_queue":
+                # Добавляем трек в очередь
+                track = data.get("track")
+                if track:
+                    room.queue.append(track)
+                    # Если ничего не играет — начинаем с первого
+                    if room.current_index == -1:
+                        room.current_index = 0
+                        await manager.broadcast({
+                            "type": "play_track",
+                            "track": room.queue[0],
+                            "index": 0,
+                        }, room_id, sender=websocket)
+                    await manager.broadcast({
+                        "type": "queue_update",
+                        "queue": room.queue,
+                        "current_index": room.current_index,
+                    }, room_id, sender=websocket)
+
+            elif msg_type == "remove_from_queue":
+                index = data.get("index")
+                if index is not None and 0 <= index < len(room.queue):
+                    room.queue.pop(index)
+                    if index < room.current_index:
+                        room.current_index -= 1
+                    elif index == room.current_index:
+                        # Удалили играющий трек — переходим к следующему
+                        if room.current_index >= len(room.queue):
+                            room.current_index = -1
+                        await manager.broadcast({
+                            "type": "queue_update",
+                            "queue": room.queue,
+                            "current_index": room.current_index,
+                        }, room_id, sender=websocket)
+                        if room.current_index >= 0:
+                            await manager.broadcast({
+                                "type": "play_track",
+                                "track": room.queue[room.current_index],
+                                "index": room.current_index,
+                            }, room_id, sender=websocket)
+                    else:
+                        await manager.broadcast({
+                            "type": "queue_update",
+                            "queue": room.queue,
+                            "current_index": room.current_index,
+                        }, room_id, sender=websocket)
+
+            elif msg_type == "next_track":
+                # Переход к следующему треку
+                if room.queue and room.current_index < len(room.queue) - 1:
+                    room.current_index += 1
+                    await manager.broadcast({
+                        "type": "play_track",
+                        "track": room.queue[room.current_index],
+                        "index": room.current_index,
+                    }, room_id, sender=websocket)
+                    await manager.broadcast({
+                        "type": "queue_update",
+                        "queue": room.queue,
+                        "current_index": room.current_index,
+                    }, room_id, sender=websocket)
+
+            elif msg_type == "track_ended":
+                # Текущий трек закончился — переходим к следующему
+                if room.queue and room.current_index < len(room.queue) - 1:
+                    room.current_index += 1
+                    await manager.broadcast({
+                        "type": "play_track",
+                        "track": room.queue[room.current_index],
+                        "index": room.current_index,
+                    }, room_id, sender=None)  # всем, включая инициатора
+                    await manager.broadcast({
+                        "type": "queue_update",
+                        "queue": room.queue,
+                        "current_index": room.current_index,
+                    }, room_id, sender=None)
+
+            else:
+                # Остальные команды (play, pause, seek, track) — просто пересылаем
+                await manager.broadcast(data, room_id, sender=websocket)
+
     except WebSocketDisconnect:
         manager.disconnect(websocket, room_id)
-    except Exception:
+    except Exception as e:
+        print(f"WS error: {e}")
         manager.disconnect(websocket, room_id)
