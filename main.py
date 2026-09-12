@@ -2,7 +2,7 @@ import os
 from typing import Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from yandex_music import Client
 
 app = FastAPI(redirect_slashes=False)
@@ -47,6 +47,11 @@ class SearchRequest(BaseModel):
 
 class TrackRequest(BaseModel):
     track_id: str
+
+    @field_validator("track_id", mode="before")
+    @classmethod
+    def coerce_to_string(cls, v):
+        return str(v)
 
 
 @app.get("/")
