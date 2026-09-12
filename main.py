@@ -1,28 +1,24 @@
 import os
-import asyncio
-from typing import Dict, Set
+from typing import Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from yandex_music import Client
 
-app = FastAPI()
+app = FastAPI(redirect_slashes=False)
 
-# CORS — разрешаем фронтенду с GitHub Pages стучаться сюда
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # для проекта на двоих сойдёт
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Токен из переменной окружения (на Render зададим вручную)
 TOKEN = os.getenv("YANDEX_TOKEN")
 client = Client(TOKEN).init()
 
-# Хранилище активных WebSocket-соединений
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Set[WebSocket] = set()
@@ -32,67 +28,72 @@ class ConnectionManager:
         self.active_connections.add(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        self.active_connections.discard(websocket)
 
     async def broadcast(self, message: dict):
-        for connection in self.active_connections:
+        for connection in list(self.active_connections):
             try:
                 await connection.send_json(message)
-            except:
-                pass
+            except Exception:
+                self.active_connections.discard(connection)
+
 
 manager = ConnectionManager()
 
-# --- Модели запросов ---
+
 class SearchRequest(BaseModel):
     query: str
+
 
 class TrackRequest(BaseModel):
     track_id: str
 
-# --- HTTP эндпоинты ---
+
 @app.get("/")
 def root():
     return {"status": "ok"}
 
+
 @app.post("/api/search")
 async def search_tracks(req: SearchRequest):
-    """Поиск треков через Яндекс Музыку"""
     try:
         result = client.search(req.query)
         tracks = []
+        if not result.tracks or not result.tracks.results:
+            return {"tracks": []}
         for track in result.tracks.results[:10]:
             tracks.append({
                 "id": track.id,
                 "title": track.title,
                 "artist": track.artists[0].name if track.artists else "Unknown",
                 "album": track.albums[0].title if track.albums else "",
-                "duration": track.duration_ms // 1000,
+                "duration": (track.duration_ms or 0) // 1000,
             })
         return {"tracks": tracks}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/api/get_link")
 async def get_track_link(req: TrackRequest):
-    """Получить прямую ссылку на полный трек"""
     try:
         track = client.tracks([req.track_id])[0]
         download_info = track.get_download_info()
-        best = download_info[-1]  # максимальное качество
+        best = download_info[-1]
         link = best.get_direct_link()
         return {"url": link}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- WebSocket для синхронизации ---
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
             data = await websocket.receive_json()
-            # Просто пересылаем всем, включая отправителя (или исключая — по желанию)
             await manager.broadcast(data)
     except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception:
         manager.disconnect(websocket)
