@@ -74,6 +74,19 @@ class TrackRequest(BaseModel):
         return str(v)
 
 
+def get_cover_url(track_obj):
+    """Извлекает ссылку на обложку из объекта трека."""
+    try:
+        if track_obj.albums and track_obj.albums[0].cover_uri:
+            cover_uri = track_obj.albums[0].cover_uri
+            # cover_uri выглядит как "avatars.yandex.net/get-music-content/..."
+            # заменяем размер на 400x400
+            return "https://" + cover_uri.replace("%%", "400x400")
+    except Exception:
+        pass
+    return ""
+
+
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -93,6 +106,7 @@ async def search_tracks(req: SearchRequest):
                 "artist": track.artists[0].name if track.artists else "Unknown",
                 "album": track.albums[0].title if track.albums else "",
                 "duration": (track.duration_ms or 0) // 1000,
+                "cover": get_cover_url(track),
             })
         return {"tracks": tracks}
     except Exception as e:
@@ -134,18 +148,24 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 track_id = data.get("track_id")
                 title = data.get("title", "")
                 artist = data.get("artist", "")
+                cover = data.get("cover", "")
                 if track_id:
                     try:
                         track_obj = client.tracks([str(track_id)])[0]
                         download_info = track_obj.get_download_info()
                         best = download_info[-1]
                         url = best.get_direct_link()
+                        
+                        # Если обложка не пришла с фронтенда — получаем на сервере
+                        if not cover:
+                            cover = get_cover_url(track_obj)
 
                         queue_track = {
                             "id": track_id,
                             "title": title,
                             "artist": artist,
                             "url": url,
+                            "cover": cover,
                         }
                         room.queue.append(queue_track)
 
