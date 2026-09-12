@@ -1,5 +1,5 @@
 import os
-from typing import Set
+from typing import Dict, Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
@@ -21,21 +21,31 @@ client = Client(TOKEN).init()
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Set[WebSocket] = set()
+        # Теперь храним комнаты: {room_id: set(websockets)}
+        self.rooms: Dict[str, Set[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, room_id: str):
         await websocket.accept()
-        self.active_connections.add(websocket)
+        if room_id not in self.rooms:
+            self.rooms[room_id] = set()
+        self.rooms[room_id].add(websocket)
 
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.discard(websocket)
+    def disconnect(self, websocket: WebSocket, room_id: str):
+        if room_id in self.rooms:
+            self.rooms[room_id].discard(websocket)
+            if not self.rooms[room_id]:
+                del self.rooms[room_id]
 
-    async def broadcast(self, message: dict):
-        for connection in list(self.active_connections):
-            try:
-                await connection.send_json(message)
-            except Exception:
-                self.active_connections.discard(connection)
+    async def broadcast(self, message: dict, room_id: str, sender: WebSocket):
+        """Рассылает всем в комнате, КРОМЕ отправителя."""
+        if room_id not in self.rooms:
+            return
+        for connection in list(self.rooms[room_id]):
+            if connection != sender:
+                try:
+                    await connection.send_json(message)
+                except Exception:
+                    self.rooms[room_id].discard(connection)
 
 
 manager = ConnectionManager()
@@ -91,14 +101,15 @@ async def get_track_link(req: TrackRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+@app.websocket("/ws/{room_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: str):
+    await manager.connect(websocket, room_id)
     try:
         while True:
             data = await websocket.receive_json()
-            await manager.broadcast(data)
+            # Рассылаем всем кроме отправителя
+            await manager.broadcast(data, room_id, websocket)
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(websocket, room_id)
     except Exception:
-        manager.disconnect(websocket)
+        manager.disconnect(websocket, room_id)
