@@ -1,68 +1,80 @@
-import json
 import os
-import random
+import json
 import time
-from typing import Dict, Set, List, Optional
+import random
+from typing import Dict, Set, List
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from yandex_music import Client
+
 app = FastAPI(redirect_slashes=False)
-app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=False, allow_methods=['*'], allow_headers=['*'])
-TOKEN = os.getenv('YANDEX_TOKEN')
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+TOKEN = os.getenv("YANDEX_TOKEN")
 client = None
 if TOKEN:
     try:
         client = Client(TOKEN).init()
     except Exception as exc:
-        print(f'[yandex] init error: {exc}')
+        print(f"[yandex] init error: {exc}")
 else:
-    print('[yandex] YANDEX_TOKEN is not configured')
-STATE_FILE = os.getenv('STATE_FILE', 'rooms_state.json')
-MAX_CHAT = 500
-CHAT_COOLDOWN = 0.7
+    print("[yandex] YANDEX_TOKEN is not configured")
+
+STATE_FILE = os.getenv("STATE_FILE", "rooms_state.json")
+
 
 class Room:
-
     def __init__(self):
         self.connections: Set[WebSocket] = set()
-        self.users: Dict[WebSocket, dict] = {}
         self.queue: List[dict] = []
-        self.current_index = -1
-        self.current_time = 0.0
-        self.is_playing = False
-        self.last_update = time.time()
-        self.repeat_mode = 'off'
-        self.shuffle = False
-        self.dj_mode = False
-        self.owner_token: Optional[str] = None
-        self.proposals: Dict[str, dict] = {}
-        self.chat_last: Dict[WebSocket, float] = {}
+        self.current_index: int = -1
+        self.current_time: float = 0.0
+        self.is_playing: bool = False
+        self.last_update: float = time.time()
+        self.repeat_mode: str = "off"  # off | all | one
+        self.shuffle: bool = False
 
-    def get_position(self):
+    def get_position(self) -> float:
         if self.is_playing:
             return max(0.0, self.current_time + (time.time() - self.last_update))
         return max(0.0, self.current_time)
 
-    def to_dict(self):
-        return {'queue': self.queue, 'current_index': self.current_index, 'current_time': self.get_position(), 'is_playing': self.is_playing, 'last_update': time.time(), 'repeat_mode': self.repeat_mode, 'shuffle': self.shuffle, 'dj_mode': self.dj_mode, 'owner_token': self.owner_token}
+    def to_dict(self) -> dict:
+        return {
+            "queue": self.queue,
+            "current_index": self.current_index,
+            "current_time": self.current_time,
+            "is_playing": self.is_playing,
+            "last_update": self.last_update,
+            "repeat_mode": self.repeat_mode,
+            "shuffle": self.shuffle,
+        }
 
     @classmethod
-    def from_dict(cls, data):
-        r = cls()
-        r.queue = data.get('queue', [])
-        r.current_index = int(data.get('current_index', -1))
-        r.current_time = float(data.get('current_time', 0) or 0)
-        r.is_playing = bool(data.get('is_playing', False))
-        r.last_update = float(data.get('last_update', time.time()))
-        r.repeat_mode = data.get('repeat_mode', 'off') if data.get('repeat_mode') in ('off', 'all', 'one') else 'off'
-        r.shuffle = bool(data.get('shuffle', False))
-        r.dj_mode = bool(data.get('dj_mode', False))
-        r.owner_token = data.get('owner_token')
-        return r
+    def from_dict(cls, data: dict) -> "Room":
+        room = cls()
+        room.queue = data.get("queue", [])
+        room.current_index = data.get("current_index", -1)
+        room.current_time = float(data.get("current_time", 0.0) or 0.0)
+        room.is_playing = bool(data.get("is_playing", False))
+        room.last_update = float(data.get("last_update", time.time()))
+        room.repeat_mode = data.get("repeat_mode", "off")
+        if room.repeat_mode not in ("off", "all", "one"):
+            room.repeat_mode = "off"
+        room.shuffle = bool(data.get("shuffle", False))
+        return room
+
 
 class ConnectionManager:
-
     def __init__(self):
         self.rooms: Dict[str, Room] = {}
         self._load_state()
@@ -70,324 +82,340 @@ class ConnectionManager:
     def _load_state(self):
         try:
             if os.path.exists(STATE_FILE):
-                with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
                     raw = json.load(f)
-                for rid, data in raw.items():
-                    self.rooms[rid] = Room.from_dict(data)
-                print(f'[state] loaded {len(self.rooms)} room(s)')
+                for room_id, data in raw.items():
+                    self.rooms[room_id] = Room.from_dict(data)
+                print(f"[state] loaded {len(self.rooms)} room(s)")
         except Exception as e:
-            print(f'[state] load error: {e}')
+            print(f"[state] load error: {e}")
 
     def save_state(self):
         try:
-            snap = {rid: r.to_dict() for rid, r in self.rooms.items()}
-            tmp = STATE_FILE + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(snap, f, ensure_ascii=False)
+            snapshot = {rid: r.to_dict() for rid, r in self.rooms.items()}
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False)
             os.replace(tmp, STATE_FILE)
         except Exception as e:
-            print(f'[state] save error: {e}')
+            print(f"[state] save error: {e}")
 
-    def get_room(self, rid):
-        if rid not in self.rooms:
-            self.rooms[rid] = Room()
-        return self.rooms[rid]
+    def get_room(self, room_id: str) -> Room:
+        if room_id not in self.rooms:
+            self.rooms[room_id] = Room()
+        return self.rooms[room_id]
 
-    async def connect(self, ws, rid):
-        await ws.accept()
-        self.get_room(rid).connections.add(ws)
+    async def connect(self, websocket: WebSocket, room_id: str):
+        await websocket.accept()
+        self.get_room(room_id).connections.add(websocket)
 
-    def disconnect(self, ws, rid):
-        r = self.rooms.get(rid)
-        if r:
-            r.connections.discard(ws)
-            r.users.pop(ws, None)
-            r.chat_last.pop(ws, None)
+    def disconnect(self, websocket: WebSocket, room_id: str):
+        room = self.rooms.get(room_id)
+        if room:
+            room.connections.discard(websocket)
 
-    async def broadcast(self, msg, rid, sender=None):
-        r = self.rooms.get(rid)
-        if not r:
+    async def broadcast(self, message: dict, room_id: str, sender: WebSocket = None):
+        room = self.rooms.get(room_id)
+        if not room:
             return
-        for c in list(r.connections):
-            if c is not sender:
+        for connection in list(room.connections):
+            if connection != sender:
                 try:
-                    await c.send_json(msg)
+                    await connection.send_json(message)
                 except Exception:
-                    r.connections.discard(c)
-                    r.users.pop(c, None)
+                    room.connections.discard(connection)
+
+
 manager = ConnectionManager()
+
 
 class SearchRequest(BaseModel):
     query: str
 
-    @field_validator('query')
+    @field_validator("query")
     @classmethod
-    def validate_query(cls, v):
-        v = v.strip()
-        if not v:
-            raise ValueError('Пустой запрос')
-        if len(v) > 200:
-            raise ValueError('Слишком длинный запрос')
-        return v
+    def validate_query(cls, value: str):
+        value = value.strip()
+        if not value:
+            raise ValueError("Пустой запрос")
+        if len(value) > 200:
+            raise ValueError("Слишком длинный запрос")
+        return value
+
 
 class TrackRequest(BaseModel):
     track_id: str
 
-    @field_validator('track_id', mode='before')
+    @field_validator("track_id", mode="before")
     @classmethod
-    def coerce(cls, v):
+    def coerce_to_string(cls, v):
         return str(v)
+
 
 def require_client():
     if client is None:
-        raise HTTPException(status_code=503, detail='YANDEX_TOKEN не настроен на сервере')
+        raise HTTPException(status_code=503, detail="YANDEX_TOKEN не настроен на сервере")
     return client
+
 
 def get_cover_url(track_obj):
     try:
         if track_obj.albums and track_obj.albums[0].cover_uri:
-            return 'https://' + track_obj.albums[0].cover_uri.replace('%%', '400x400')
+            return "https://" + track_obj.albums[0].cover_uri.replace("%%", "400x400")
     except Exception:
         pass
-    return ''
+    return ""
 
-@app.get('/')
+
+@app.get("/")
 def root():
-    return {'status': 'ok', 'service': 'sync-music', 'version': '3.0'}
+    return {"status": "ok", "service": "sync-music", "version": "2.0"}
 
-@app.get('/health')
+
+@app.get("/health")
 def health():
-    return {'status': 'ok', 'yandex_configured': client is not None, 'rooms': len(manager.rooms)}
+    return {"status": "ok", "yandex_configured": client is not None, "rooms": len(manager.rooms)}
 
-@app.post('/api/search')
+
+@app.post("/api/search")
 async def search_tracks(req: SearchRequest):
     ym = require_client()
     try:
         result = ym.search(req.query)
-        rows = []
+        tracks = []
         if not result.tracks or not result.tracks.results:
-            return {'tracks': []}
-        for t in result.tracks.results[:10]:
-            rows.append({'id': t.id, 'title': t.title, 'artist': t.artists[0].name if t.artists else 'Unknown', 'album': t.albums[0].title if t.albums else '', 'duration': (t.duration_ms or 0) // 1000, 'cover': get_cover_url(t)})
-        return {'tracks': rows}
+            return {"tracks": []}
+        for track in result.tracks.results[:10]:
+            tracks.append({
+                "id": track.id,
+                "title": track.title,
+                "artist": track.artists[0].name if track.artists else "Unknown",
+                "album": track.albums[0].title if track.albums else "",
+                "duration": (track.duration_ms or 0) // 1000,
+                "cover": get_cover_url(track),
+            })
+        return {"tracks": tracks}
     except HTTPException:
         raise
     except Exception as e:
-        print(f'[search] {e}')
-        raise HTTPException(status_code=502, detail='Ошибка поиска музыки')
+        print(f"[search] error: {e}")
+        raise HTTPException(status_code=502, detail="Ошибка поиска музыки")
 
-@app.post('/api/get_link')
+
+@app.post("/api/get_link")
 async def get_track_link(req: TrackRequest):
     ym = require_client()
     try:
-        t = ym.tracks([req.track_id])[0]
-        info = t.get_download_info()
-        if not info:
-            raise RuntimeError('Нет вариантов загрузки')
-        return {'url': info[-1].get_direct_link()}
+        track = ym.tracks([req.track_id])[0]
+        download_info = track.get_download_info()
+        if not download_info:
+            raise RuntimeError("Нет вариантов загрузки")
+        best = download_info[-1]
+        return {"url": best.get_direct_link()}
     except Exception as e:
-        print(f'[link] {e}')
-        raise HTTPException(status_code=502, detail='Не удалось получить ссылку трека')
+        print(f"[link] error: {e}")
+        raise HTTPException(status_code=502, detail="Не удалось получить ссылку трека")
 
-def public_participants(room):
-    out = []
-    for ws, u in room.users.items():
-        out.append({'name': u.get('name') or 'Гость', 'color': u.get('color', '#6d5dfc'), 'is_owner': u.get('token') == room.owner_token, 'is_playing': room.is_playing})
-    return out
 
-async def send_full_state(ws, room):
+async def send_full_state(websocket: WebSocket, room: Room):
     track = room.queue[room.current_index] if 0 <= room.current_index < len(room.queue) else None
-    u = room.users.get(ws, {})
-    await ws.send_json({'type': 'full_state', 'queue': room.queue, 'current_index': room.current_index, 'current_time': room.get_position(), 'is_playing': room.is_playing, 'track': track, 'repeat_mode': room.repeat_mode, 'shuffle': room.shuffle, 'dj_mode': room.dj_mode, 'is_owner': u.get('token') == room.owner_token, 'participants': public_participants(room)})
+    await websocket.send_json({
+        "type": "full_state",
+        "queue": room.queue,
+        "current_index": room.current_index,
+        "current_time": room.get_position(),
+        "is_playing": room.is_playing,
+        "track": track,
+        "repeat_mode": room.repeat_mode,
+        "shuffle": room.shuffle,
+    })
 
-async def participant_update(rid):
-    await manager.broadcast({'type': 'participant_update', 'participants': public_participants(manager.get_room(rid))}, rid)
 
-async def queue_update(rid, room):
+async def broadcast_queue_update(room_id: str, room: Room):
     manager.save_state()
-    await manager.broadcast({'type': 'queue_update', 'queue': room.queue, 'current_index': room.current_index}, rid)
+    await manager.broadcast({
+        "type": "queue_update",
+        "queue": room.queue,
+        "current_index": room.current_index,
+    }, room_id)
 
-async def settings_update(rid, room):
+
+async def broadcast_room_settings(room_id: str, room: Room):
     manager.save_state()
-    await manager.broadcast({'type': 'room_settings', 'repeat_mode': room.repeat_mode, 'shuffle': room.shuffle, 'dj_mode': room.dj_mode}, rid)
+    await manager.broadcast({
+        "type": "room_settings",
+        "repeat_mode": room.repeat_mode,
+        "shuffle": room.shuffle,
+    }, room_id)
 
-async def play_track(rid, room, index, t=0):
-    if not 0 <= index < len(room.queue):
+
+async def broadcast_play_track(room_id: str, room: Room, index: int, time_: float = 0.0):
+    if not (0 <= index < len(room.queue)):
         return
     room.current_index = index
-    room.current_time = max(0, float(t))
+    room.current_time = max(0.0, float(time_))
     room.is_playing = True
     room.last_update = time.time()
     manager.save_state()
-    await manager.broadcast({'type': 'play_track', 'track': room.queue[index], 'index': index, 'time': room.current_time}, rid)
-    await queue_update(rid, room)
+    await manager.broadcast({
+        "type": "play_track",
+        "track": room.queue[index],
+        "index": index,
+        "time": room.current_time,
+    }, room_id)
+    await broadcast_queue_update(room_id, room)
 
-def choose_next(room):
+
+def choose_next_index(room: Room):
     if not room.queue:
         return None
-    if room.repeat_mode == 'one' and room.current_index >= 0:
+    if room.repeat_mode == "one" and room.current_index >= 0:
         return room.current_index
     if room.shuffle and len(room.queue) > 1:
-        return random.choice([i for i in range(len(room.queue)) if i != room.current_index])
-    n = room.current_index + 1
-    if n < len(room.queue):
-        return n
-    return 0 if room.repeat_mode == 'all' else None
+        choices = [i for i in range(len(room.queue)) if i != room.current_index]
+        return random.choice(choices)
+    nxt = room.current_index + 1
+    if nxt < len(room.queue):
+        return nxt
+    if room.repeat_mode == "all":
+        return 0
+    return None
 
-def can_control(room, ws):
-    return not room.dj_mode or room.users.get(ws, {}).get('token') == room.owner_token
 
-@app.websocket('/ws/{room_id}')
+@app.websocket("/ws/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
     await manager.connect(websocket, room_id)
     room = manager.get_room(room_id)
     try:
+        await send_full_state(websocket, room)
         while True:
             data = await websocket.receive_json()
-            typ = data.get('type')
-            if typ == 'hello':
-                token = str(data.get('token') or '')[:100]
-                uname = str(data.get('name') or 'Гость').strip()[:24] or 'Гость'
-                if not token:
-                    token = f'server-{id(websocket)}'
-                if room.owner_token is None:
-                    room.owner_token = token
-                room.users[websocket] = {'token': token, 'name': uname, 'color': data.get('color') or '#6d5dfc'}
-                await send_full_state(websocket, room)
-                await participant_update(room_id)
-                continue
-            if websocket not in room.users:
-                continue
-            user = room.users[websocket]
-            name = user.get('name') or 'Гость'
-            if typ == 'add_to_queue':
-                tid = data.get('track_id')
-                if not tid:
+            msg_type = data.get("type")
+
+            if msg_type == "add_to_queue":
+                track_id = data.get("track_id")
+                if not track_id:
                     continue
                 try:
                     ym = require_client()
-                    tr = ym.tracks([str(tid)])[0]
-                    info = tr.get_download_info()
+                    track_obj = ym.tracks([str(track_id)])[0]
+                    info = track_obj.get_download_info()
                     if not info:
                         continue
-                    room.queue.append({'id': str(tid), 'title': str(data.get('title') or tr.title)[:200], 'artist': str(data.get('artist') or 'Unknown')[:120], 'album': str(data.get('album') or (tr.albums[0].title if tr.albums else ''))[:160], 'url': info[-1].get_direct_link(), 'cover': str(data.get('cover') or get_cover_url(tr))[:1000], 'added_by': name})
+                    url = info[-1].get_direct_link()
+                    cover = data.get("cover", "") or get_cover_url(track_obj)
+                    queue_track = {
+                        "id": str(track_id),
+                        "title": str(data.get("title", track_obj.title)),
+                        "artist": str(data.get("artist", "Unknown")),
+                        "url": url,
+                        "cover": cover,
+                        "added_by": str(data.get("added_by", "Кто-то"))[:24],
+                    }
+                    room.queue.append(queue_track)
                     if room.current_index == -1:
-                        await play_track(room_id, room, 0, 0)
+                        await broadcast_play_track(room_id, room, 0, 0.0)
                     else:
-                        await queue_update(room_id, room)
-                    await manager.broadcast({'type': 'system_message', 'text': f'{name} добавил трек в очередь', 'time': time.time()}, room_id)
+                        await broadcast_queue_update(room_id, room)
                 except Exception as e:
-                    print(f'[queue:add] {e}')
-            elif typ in {'remove_from_queue', 'reorder_queue', 'play_track_manual', 'play_track_manual_by_id', 'next_track', 'prev_track', 'track_ended', 'play', 'pause', 'seek', 'set_repeat', 'set_shuffle'} and (not can_control(room, websocket)):
-                await websocket.send_json({'type': 'system_message', 'text': 'DJ Mode: управлять воспроизведением может только владелец комнаты', 'time': time.time()})
-                continue
-            elif typ == 'remove_from_queue':
-                i = data.get('index')
-                if not isinstance(i, int) or not 0 <= i < len(room.queue):
+                    print(f"[queue:add] {e}")
+
+            elif msg_type == "remove_from_queue":
+                index = data.get("index")
+                if index is None or not 0 <= index < len(room.queue):
                     continue
-                was = i == room.current_index
-                room.queue.pop(i)
+                was_current = index == room.current_index
+                room.queue.pop(index)
                 if not room.queue:
-                    room.current_index = -1
-                    room.current_time = 0
-                    room.is_playing = False
+                    room.current_index, room.current_time, room.is_playing = -1, 0.0, False
                     room.last_update = time.time()
-                    await queue_update(room_id, room)
-                elif was:
-                    await play_track(room_id, room, min(i, len(room.queue) - 1), 0)
+                    await broadcast_queue_update(room_id, room)
+                elif was_current:
+                    new_index = min(index, len(room.queue) - 1)
+                    await broadcast_play_track(room_id, room, new_index, 0.0)
                 else:
-                    if i < room.current_index:
+                    if index < room.current_index:
                         room.current_index -= 1
-                    await queue_update(room_id, room)
-            elif typ == 'reorder_queue':
-                a, b = (data.get('from'), data.get('to'))
-                if not all((isinstance(x, int) for x in (a, b))) or not (0 <= a < len(room.queue) and 0 <= b < len(room.queue)):
+                    await broadcast_queue_update(room_id, room)
+
+            elif msg_type == "reorder_queue":
+                a, b = data.get("from"), data.get("to")
+                if a is None or b is None or not (0 <= a < len(room.queue) and 0 <= b < len(room.queue)):
                     continue
-                tr = room.queue.pop(a)
-                room.queue.insert(b, tr)
+                track = room.queue.pop(a)
+                room.queue.insert(b, track)
                 if room.current_index == a:
                     room.current_index = b
                 elif a < room.current_index <= b:
                     room.current_index -= 1
                 elif b <= room.current_index < a:
                     room.current_index += 1
-                await queue_update(room_id, room)
-            elif typ in ('next_track', 'track_ended'):
-                if typ == 'track_ended' and data.get('expected_index') is not None and (data.get('expected_index') != room.current_index):
-                    continue
-                idx = choose_next(room)
-                if idx is None:
+                await broadcast_queue_update(room_id, room)
+
+            elif msg_type == "next_track":
+                idx = choose_next_index(room)
+                if idx is not None:
+                    await broadcast_play_track(room_id, room, idx, 0.0)
+                else:
                     room.is_playing = False
-                    room.current_time = 0
+                    room.current_time = 0.0
                     room.last_update = time.time()
                     manager.save_state()
-                    await manager.broadcast({'type': 'pause', 'time': 0}, room_id)
+
+            elif msg_type == "prev_track":
+                if room.queue and room.current_index > 0:
+                    await broadcast_play_track(room_id, room, room.current_index - 1, 0.0)
+
+            elif msg_type == "play_track_manual":
+                index = data.get("index")
+                if index is not None and 0 <= index < len(room.queue):
+                    await broadcast_play_track(room_id, room, index, 0.0)
+
+            elif msg_type == "track_ended":
+                expected = data.get("expected_index")
+                if expected is not None and expected != room.current_index:
+                    continue
+                idx = choose_next_index(room)
+                if idx is not None:
+                    await broadcast_play_track(room_id, room, idx, 0.0)
                 else:
-                    await play_track(room_id, room, idx, 0)
-            elif typ == 'prev_track':
-                if room.current_index > 0:
-                    await play_track(room_id, room, room.current_index - 1, 0)
-            elif typ == 'play_track_manual':
-                i = data.get('index')
-                if isinstance(i, int) and 0 <= i < len(room.queue):
-                    await play_track(room_id, room, i, 0)
-            elif typ == 'play_track_manual_by_id':
-                tid = str(data.get('track_id'))
-                i = next((i for i, t in enumerate(room.queue) if str(t.get('id')) == tid), None)
-                if i is not None:
-                    await play_track(room_id, room, i, 0)
-            elif typ == 'set_repeat':
-                mode = data.get('mode', 'off')
-                if mode in ('off', 'all', 'one'):
+                    room.is_playing = False
+                    room.current_time = 0.0
+                    room.last_update = time.time()
+                    manager.save_state()
+
+            elif msg_type == "set_repeat":
+                mode = data.get("mode", "off")
+                if mode in ("off", "all", "one"):
                     room.repeat_mode = mode
-                    await settings_update(room_id, room)
-            elif typ == 'set_shuffle':
-                room.shuffle = bool(data.get('enabled'))
-                await settings_update(room_id, room)
-            elif typ == 'play':
+                    await broadcast_room_settings(room_id, room)
+
+            elif msg_type == "set_shuffle":
+                room.shuffle = bool(data.get("enabled"))
+                await broadcast_room_settings(room_id, room)
+
+            elif msg_type == "play":
                 room.is_playing = True
-                room.current_time = max(0, float(data.get('time', 0)))
+                room.current_time = max(0.0, float(data.get("time", 0)))
                 room.last_update = time.time()
                 manager.save_state()
-                await manager.broadcast({'type': 'play', 'time': room.current_time}, room_id, websocket)
-                await participant_update(room_id)
-            elif typ == 'pause':
+                await manager.broadcast({"type": "play", "time": room.current_time}, room_id, sender=websocket)
+
+            elif msg_type == "pause":
                 room.is_playing = False
-                room.current_time = max(0, float(data.get('time', room.get_position())))
+                room.current_time = max(0.0, float(data.get("time", room.get_position())))
                 room.last_update = time.time()
                 manager.save_state()
-                await manager.broadcast({'type': 'pause', 'time': room.current_time}, room_id, websocket)
-                await participant_update(room_id)
-            elif typ == 'seek':
-                room.current_time = max(0, float(data.get('time', 0)))
+                await manager.broadcast({"type": "pause", "time": room.current_time}, room_id, sender=websocket)
+
+            elif msg_type == "seek":
+                room.current_time = max(0.0, float(data.get("time", 0)))
                 room.last_update = time.time()
                 manager.save_state()
-                await manager.broadcast({'type': 'seek', 'time': room.current_time}, room_id, websocket)
-            elif typ == 'set_dj_mode':
-                if user.get('token') != room.owner_token:
-                    continue
-                room.dj_mode = bool(data.get('enabled'))
-                await settings_update(room_id, room)
-                await manager.broadcast({'type': 'system_message', 'text': f"{name} {('включил' if room.dj_mode else 'выключил')} DJ Mode", 'time': time.time()}, room_id)
-            elif typ == 'chat_message':
-                now = time.monotonic()
-                last = room.chat_last.get(websocket, 0)
-                if now - last < CHAT_COOLDOWN:
-                    continue
-                text = str(data.get('text') or '').strip()[:MAX_CHAT]
-                if not text:
-                    continue
-                room.chat_last[websocket] = now
-                await manager.broadcast({'type': 'chat_message', 'message': {'name': name, 'text': text, 'time': time.time()}}, room_id)
-            elif typ == 'reaction':
-                reaction = str(data.get('reaction') or '')[:4]
-                allowed = {'❤️', '🔥', '😂', '👍'}
-                if reaction in allowed:
-                    await manager.broadcast({'type': 'reaction', 'reaction': reaction, 'name': name}, room_id)
+                await manager.broadcast({"type": "seek", "time": room.current_time}, room_id, sender=websocket)
+
     except WebSocketDisconnect:
         manager.disconnect(websocket, room_id)
-        await participant_update(room_id)
     except Exception as e:
-        print(f'[ws] error: {e}')
+        print(f"[ws] error: {e}")
         manager.disconnect(websocket, room_id)
-        await participant_update(room_id)
