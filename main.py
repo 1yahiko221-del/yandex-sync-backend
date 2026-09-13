@@ -46,6 +46,8 @@ class Room:
         self.blocked_tokens: Set[str] = set()
         self.history: List[dict] = []
         self.empty_since: Optional[float] = None
+        self.room_name = 'Комната'
+        self.chat_reactions: Dict[str, Dict[str, str]] = {}
 
     def get_position(self):
         if self.is_playing:
@@ -53,7 +55,7 @@ class Room:
         return max(0.0, self.current_time)
 
     def to_dict(self):
-        return {'queue': self.queue, 'current_index': self.current_index, 'current_time': self.get_position(), 'is_playing': self.is_playing, 'last_update': time.time(), 'repeat_mode': self.repeat_mode, 'shuffle': self.shuffle, 'dj_mode': self.dj_mode, 'owner_token': self.owner_token, 'shared_playlists': list(self.shared_playlists.values()), 'history': self.history[-MAX_ROOM_HISTORY:], 'blocked_tokens': list(self.blocked_tokens), 'empty_since': self.empty_since}
+        return {'queue': self.queue, 'current_index': self.current_index, 'current_time': self.get_position(), 'is_playing': self.is_playing, 'last_update': time.time(), 'repeat_mode': self.repeat_mode, 'shuffle': self.shuffle, 'dj_mode': self.dj_mode, 'owner_token': self.owner_token, 'shared_playlists': list(self.shared_playlists.values()), 'history': self.history[-MAX_ROOM_HISTORY:], 'blocked_tokens': list(self.blocked_tokens), 'empty_since': self.empty_since, 'room_name': self.room_name, 'chat_reactions': self.chat_reactions}
 
     @classmethod
     def from_dict(cls, data):
@@ -70,6 +72,9 @@ class Room:
         r.history = list(data.get('history', []) or [])[-MAX_ROOM_HISTORY:]
         r.blocked_tokens = set(str(x) for x in (data.get('blocked_tokens', []) or []))
         r.empty_since = data.get('empty_since')
+        r.room_name = str(data.get('room_name') or 'Комната')[:60] or 'Комната'
+        raw_reactions = data.get('chat_reactions') or {}
+        r.chat_reactions = raw_reactions if isinstance(raw_reactions, dict) else {}
         for playlist in data.get('shared_playlists', []) or []:
             if isinstance(playlist, dict) and playlist.get('id'):
                 playlist = dict(playlist)
@@ -288,7 +293,7 @@ def public_shared_playlists(room):
 async def send_full_state(ws, room):
     track = room.queue[room.current_index] if 0 <= room.current_index < len(room.queue) else None
     u = room.users.get(ws, {})
-    await ws.send_json({'type': 'full_state', 'queue': room.queue, 'current_index': room.current_index, 'current_time': room.get_position(), 'is_playing': room.is_playing, 'track': track, 'repeat_mode': room.repeat_mode, 'shuffle': room.shuffle, 'dj_mode': room.dj_mode, 'is_owner': u.get('token') == room.owner_token, 'participants': public_participants(room), 'self_id': participant_id(u.get('token', '')), 'shared_playlists': public_shared_playlists(room), 'room_history': room.history[-MAX_ROOM_HISTORY:]})
+    await ws.send_json({'type': 'full_state', 'queue': room.queue, 'current_index': room.current_index, 'current_time': room.get_position(), 'is_playing': room.is_playing, 'track': track, 'repeat_mode': room.repeat_mode, 'shuffle': room.shuffle, 'dj_mode': room.dj_mode, 'is_owner': u.get('token') == room.owner_token, 'participants': public_participants(room), 'self_id': participant_id(u.get('token', '')), 'shared_playlists': public_shared_playlists(room), 'room_history': room.history[-MAX_ROOM_HISTORY:], 'room_name': room.room_name})
 
 async def participant_update(rid):
     await manager.broadcast({'type': 'participant_update', 'participants': public_participants(manager.get_room(rid))}, rid)
@@ -420,6 +425,18 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 except Exception:
                     pass
                 break
+            if typ == 'rename_room':
+                if user.get('token') != room.owner_token:
+                    continue
+                new_name = str(data.get('name') or '').strip()[:60]
+                if not new_name:
+                    continue
+                old_name = room.room_name
+                room.room_name = new_name
+                manager.save_state()
+                await manager.broadcast({'type': 'room_renamed', 'name': room.room_name}, room_id)
+                await manager.broadcast({'type': 'system_message', 'text': f'{name} переименовал комнату «{old_name}» → «{room.room_name}»', 'time': time.time()}, room_id)
+                continue
             if typ == 'transfer_owner':
                 if user.get('token') != room.owner_token:
                     continue
@@ -755,9 +772,25 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             elif typ == 'chat_reaction':
                 message_id = str(data.get('message_id') or '')[:32]
                 reaction = str(data.get('reaction') or '')[:8]
-                allowed = {'❤️', '🔥', '😂', '👍', '👎', '👏', '🎵'}
+                allowed = {'❤️', '🔥', '😂', '👍', '👎', '👏', '🎵', '🤣', '😍', '😢', '😡', '🤯', '🎉', '✨', '💯'}
                 if message_id and reaction in allowed:
-                    await manager.broadcast({'type': 'reaction_message', 'message_id': message_id, 'reaction': reaction, 'name': name}, room_id)
+                    token = str(user.get('token') or '')
+                    reactions_for_message = room.chat_reactions.setdefault(message_id, {})
+                    previous = reactions_for_message.get(token)
+                    # Один пользователь может иметь только одну реакцию одного типа на сообщение.
+                    # Нажатие той же реакции повторно ничего не добавляет.
+                    if previous == reaction:
+                        await websocket.send_json({'type': 'reaction_self', 'message_id': message_id, 'reaction': reaction, 'active': True})
+                        continue
+                    if previous:
+                        reactions_for_message.pop(token, None)
+                    reactions_for_message[token] = reaction
+                    counts = {}
+                    for value in reactions_for_message.values():
+                        counts[value] = counts.get(value, 0) + 1
+                    manager.save_state()
+                    await manager.broadcast({'type': 'reaction_update', 'message_id': message_id, 'reactions': counts}, room_id)
+                    await websocket.send_json({'type': 'reaction_self', 'message_id': message_id, 'reaction': reaction, 'active': True})
                 continue
             elif typ == 'reaction':
                 reaction = str(data.get('reaction') or '')[:4]
