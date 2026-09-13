@@ -2,6 +2,7 @@ import json
 import os
 import random
 import time
+import hashlib
 from typing import Dict, Set, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,6 +39,8 @@ class Room:
         self.owner_token: Optional[str] = None
         self.proposals: Dict[str, dict] = {}
         self.chat_last: Dict[WebSocket, float] = {}
+        self.shared_playlists: Dict[str, dict] = {}
+        self.blocked_tokens: Set[str] = set()
 
     def get_position(self):
         if self.is_playing:
@@ -45,7 +48,7 @@ class Room:
         return max(0.0, self.current_time)
 
     def to_dict(self):
-        return {'queue': self.queue, 'current_index': self.current_index, 'current_time': self.get_position(), 'is_playing': self.is_playing, 'last_update': time.time(), 'repeat_mode': self.repeat_mode, 'shuffle': self.shuffle, 'dj_mode': self.dj_mode, 'owner_token': self.owner_token}
+        return {'queue': self.queue, 'current_index': self.current_index, 'current_time': self.get_position(), 'is_playing': self.is_playing, 'last_update': time.time(), 'repeat_mode': self.repeat_mode, 'shuffle': self.shuffle, 'dj_mode': self.dj_mode, 'owner_token': self.owner_token, 'shared_playlists': list(self.shared_playlists.values())}
 
     @classmethod
     def from_dict(cls, data):
@@ -59,6 +62,9 @@ class Room:
         r.shuffle = bool(data.get('shuffle', False))
         r.dj_mode = bool(data.get('dj_mode', False))
         r.owner_token = data.get('owner_token')
+        for playlist in data.get('shared_playlists', []) or []:
+            if isinstance(playlist, dict) and playlist.get('id'):
+                r.shared_playlists[str(playlist['id'])] = playlist
         return r
 
 class ConnectionManager:
@@ -100,9 +106,17 @@ class ConnectionManager:
     def disconnect(self, ws, rid):
         r = self.rooms.get(rid)
         if r:
+            departing = r.users.get(ws, {})
+            departing_token = departing.get('token')
             r.connections.discard(ws)
             r.users.pop(ws, None)
             r.chat_last.pop(ws, None)
+            if departing_token and departing_token == r.owner_token and r.users:
+                # Если владелец вышел, передаём владение оставшемуся участнику.
+                r.owner_token = next(iter(r.users.values())).get('token')
+            if not r.users:
+                r.owner_token = departing_token or r.owner_token
+            self.save_state()
 
     async def broadcast(self, msg, rid, sender=None):
         r = self.rooms.get(rid)
@@ -151,6 +165,22 @@ def get_cover_url(track_obj):
         pass
     return ''
 
+def get_duration_seconds(track_obj):
+    """Return track duration in seconds across yandex-music versions."""
+    try:
+        value = getattr(track_obj, 'duration_ms', None)
+        if value:
+            return int(value) // 1000
+    except Exception:
+        pass
+    try:
+        value = getattr(track_obj, 'duration', None)
+        if value:
+            return int(value)
+    except Exception:
+        pass
+    return 0
+
 @app.get('/')
 def root():
     return {'status': 'ok', 'service': 'sync-music', 'version': '3.0'}
@@ -168,7 +198,7 @@ async def search_tracks(req: SearchRequest):
         if not result.tracks or not result.tracks.results:
             return {'tracks': []}
         for t in result.tracks.results[:10]:
-            rows.append({'id': t.id, 'title': t.title, 'artist': t.artists[0].name if t.artists else 'Unknown', 'album': t.albums[0].title if t.albums else '', 'duration': (t.duration_ms or 0) // 1000, 'cover': get_cover_url(t)})
+            rows.append({'id': t.id, 'title': t.title, 'artist': t.artists[0].name if t.artists else 'Unknown', 'album': t.albums[0].title if t.albums else '', 'duration': get_duration_seconds(t), 'cover': get_cover_url(t)})
         return {'tracks': rows}
     except HTTPException:
         raise
@@ -189,16 +219,40 @@ async def get_track_link(req: TrackRequest):
         print(f'[link] {e}')
         raise HTTPException(status_code=502, detail='Не удалось получить ссылку трека')
 
+def participant_id(token: str) -> str:
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()[:12]
+
 def public_participants(room):
     out = []
     for ws, u in room.users.items():
-        out.append({'name': u.get('name') or 'Гость', 'color': u.get('color', '#6d5dfc'), 'is_owner': u.get('token') == room.owner_token, 'is_playing': room.is_playing})
+        token = u.get('token', '')
+        out.append({
+            'id': participant_id(token),
+            'name': u.get('name') or 'Гость',
+            'color': u.get('color', '#6d5dfc'),
+            'is_owner': token == room.owner_token,
+            'is_playing': room.is_playing
+        })
     return out
+
+def public_shared_playlists(room):
+    result = []
+    for p in room.shared_playlists.values():
+        result.append({
+            'id': p.get('id'),
+            'name': p.get('name', 'Совместный плейлист'),
+            'description': p.get('description', ''),
+            'owner_id': p.get('owner_id'),
+            'member_ids': list(p.get('member_ids', [])),
+            'tracks': list(p.get('tracks', [])),
+            'created_at': p.get('created_at')
+        })
+    return result
 
 async def send_full_state(ws, room):
     track = room.queue[room.current_index] if 0 <= room.current_index < len(room.queue) else None
     u = room.users.get(ws, {})
-    await ws.send_json({'type': 'full_state', 'queue': room.queue, 'current_index': room.current_index, 'current_time': room.get_position(), 'is_playing': room.is_playing, 'track': track, 'repeat_mode': room.repeat_mode, 'shuffle': room.shuffle, 'dj_mode': room.dj_mode, 'is_owner': u.get('token') == room.owner_token, 'participants': public_participants(room)})
+    await ws.send_json({'type': 'full_state', 'queue': room.queue, 'current_index': room.current_index, 'current_time': room.get_position(), 'is_playing': room.is_playing, 'track': track, 'repeat_mode': room.repeat_mode, 'shuffle': room.shuffle, 'dj_mode': room.dj_mode, 'is_owner': u.get('token') == room.owner_token, 'participants': public_participants(room), 'self_id': participant_id(u.get('token', '')), 'shared_playlists': public_shared_playlists(room)})
 
 async def participant_update(rid):
     await manager.broadcast({'type': 'participant_update', 'participants': public_participants(manager.get_room(rid))}, rid)
@@ -210,6 +264,10 @@ async def queue_update(rid, room):
 async def settings_update(rid, room):
     manager.save_state()
     await manager.broadcast({'type': 'room_settings', 'repeat_mode': room.repeat_mode, 'shuffle': room.shuffle, 'dj_mode': room.dj_mode}, rid)
+
+async def shared_playlists_update(rid, room):
+    manager.save_state()
+    await manager.broadcast({'type': 'shared_playlists', 'playlists': public_shared_playlists(room)}, rid)
 
 async def play_track(rid, room, index, t=0):
     if not 0 <= index < len(room.queue):
@@ -250,6 +308,11 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 uname = str(data.get('name') or 'Гость').strip()[:24] or 'Гость'
                 if not token:
                     token = f'server-{id(websocket)}'
+                if token in room.blocked_tokens:
+                    await websocket.send_json({'type': 'kicked', 'text': 'Ты был удалён из комнаты владельцем.'})
+                    await websocket.close(code=4003)
+                    manager.disconnect(websocket, room_id)
+                    continue
                 if room.owner_token is None:
                     room.owner_token = token
                 room.users[websocket] = {'token': token, 'name': uname, 'color': data.get('color') or '#6d5dfc'}
@@ -260,6 +323,102 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 continue
             user = room.users[websocket]
             name = user.get('name') or 'Гость'
+            if typ == 'leave_room':
+                await websocket.send_json({'type': 'left_room'})
+                manager.disconnect(websocket, room_id)
+                await participant_update(room_id)
+                try:
+                    await websocket.close(code=1000)
+                except Exception:
+                    pass
+                break
+            if typ == 'kick_participant':
+                if user.get('token') != room.owner_token:
+                    continue
+                target_id = str(data.get('participant_id') or '')
+                target_ws = next((candidate for candidate, candidate_user in room.users.items() if participant_id(candidate_user.get('token', '')) == target_id), None)
+                if target_ws is None or target_ws is websocket:
+                    continue
+                target_user = room.users.get(target_ws, {})
+                target_token = target_user.get('token', '')
+                room.blocked_tokens.add(target_token)
+                try:
+                    await target_ws.send_json({'type': 'kicked', 'text': 'Владелец удалил тебя из комнаты.'})
+                    await target_ws.close(code=4003)
+                except Exception:
+                    pass
+                manager.disconnect(target_ws, room_id)
+                await participant_update(room_id)
+                await manager.broadcast({'type': 'system_message', 'text': f'{name} удалил участника из комнаты', 'time': time.time()}, room_id)
+                continue
+            if typ == 'shared_playlist_create':
+                playlist_name = str(data.get('name') or '').strip()[:80]
+                if not playlist_name:
+                    continue
+                owner_id = participant_id(user.get('token', ''))
+                member_ids = [str(x)[:32] for x in (data.get('member_ids') or []) if x]
+                member_ids = list(dict.fromkeys([owner_id] + member_ids))
+                playlist_id = str(data.get('id') or '')[:64] or hashlib.sha256(f'{room_id}:{time.time()}:{owner_id}'.encode()).hexdigest()[:16]
+                room.shared_playlists[playlist_id] = {
+                    'id': playlist_id,
+                    'name': playlist_name,
+                    'description': str(data.get('description') or '').strip()[:240],
+                    'owner_id': owner_id,
+                    'member_ids': member_ids,
+                    'tracks': [],
+                    'created_at': time.time()
+                }
+                await shared_playlists_update(room_id, room)
+                continue
+            if typ == 'shared_playlist_update_members':
+                playlist = room.shared_playlists.get(str(data.get('playlist_id') or ''))
+                owner_id = participant_id(user.get('token', ''))
+                if not playlist or playlist.get('owner_id') != owner_id:
+                    continue
+                member_ids = [str(x)[:32] for x in (data.get('member_ids') or []) if x]
+                playlist['member_ids'] = list(dict.fromkeys([owner_id] + member_ids))
+                await shared_playlists_update(room_id, room)
+                continue
+            if typ == 'shared_playlist_add_track':
+                playlist = room.shared_playlists.get(str(data.get('playlist_id') or ''))
+                user_id = participant_id(user.get('token', ''))
+                if not playlist or user_id not in playlist.get('member_ids', []):
+                    continue
+                track = data.get('track')
+                if not isinstance(track, dict) or not track.get('id'):
+                    continue
+                if any(str(x.get('id')) == str(track.get('id')) for x in playlist.get('tracks', [])):
+                    continue
+                safe_track = {
+                    'id': str(track.get('id'))[:100],
+                    'title': str(track.get('title') or '')[:200],
+                    'artist': str(track.get('artist') or 'Unknown')[:120],
+                    'album': str(track.get('album') or '')[:160],
+                    'cover': str(track.get('cover') or '')[:1000],
+                    'duration': max(0, int(track.get('duration') or 0)),
+                    'added_by': name
+                }
+                playlist.setdefault('tracks', []).append(safe_track)
+                await shared_playlists_update(room_id, room)
+                continue
+            if typ == 'shared_playlist_remove_track':
+                playlist = room.shared_playlists.get(str(data.get('playlist_id') or ''))
+                user_id = participant_id(user.get('token', ''))
+                if not playlist or user_id not in playlist.get('member_ids', []):
+                    continue
+                track_id = str(data.get('track_id') or '')
+                playlist['tracks'] = [x for x in playlist.get('tracks', []) if str(x.get('id')) != track_id]
+                await shared_playlists_update(room_id, room)
+                continue
+            if typ == 'shared_playlist_delete':
+                playlist_id = str(data.get('playlist_id') or '')
+                playlist = room.shared_playlists.get(playlist_id)
+                owner_id = participant_id(user.get('token', ''))
+                if not playlist or playlist.get('owner_id') != owner_id:
+                    continue
+                room.shared_playlists.pop(playlist_id, None)
+                await shared_playlists_update(room_id, room)
+                continue
             if typ == 'add_to_queue':
                 tid = data.get('track_id')
                 if not tid:
@@ -270,7 +429,24 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     info = tr.get_download_info()
                     if not info:
                         continue
-                    room.queue.append({'id': str(tid), 'title': str(data.get('title') or tr.title)[:200], 'artist': str(data.get('artist') or 'Unknown')[:120], 'album': str(data.get('album') or (tr.albums[0].title if tr.albums else ''))[:160], 'url': info[-1].get_direct_link(), 'cover': str(data.get('cover') or get_cover_url(tr))[:1000], 'added_by': name})
+                    if any(str(item.get('id')) == str(tid) for item in room.queue):
+                        await websocket.send_json({'type': 'system_message', 'text': 'Этот трек уже находится в очереди', 'time': time.time()})
+                        continue
+
+                    duration = int(data.get('duration') or 0)
+                    if duration <= 0:
+                        duration = get_duration_seconds(tr)
+
+                    room.queue.append({
+                        'id': str(tid),
+                        'title': str(data.get('title') or tr.title)[:200],
+                        'artist': str(data.get('artist') or 'Unknown')[:120],
+                        'album': str(data.get('album') or (tr.albums[0].title if tr.albums else ''))[:160],
+                        'url': info[-1].get_direct_link(),
+                        'cover': str(data.get('cover') or get_cover_url(tr))[:1000],
+                        'duration': duration,
+                        'added_by': name
+                    })
                     if room.current_index == -1:
                         await play_track(room_id, room, 0, 0)
                     else:
